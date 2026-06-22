@@ -1,15 +1,22 @@
+-- Wireshark dissector for MMDVM / Homebrew (HBP) protocol.
+-- Based on marrold/MMDVM-Dissector with DMRA Talker Alias support (ADN / MMDVMHost HBP).
+--
+-- Install: copy to Wireshark plugins dir and restart Wireshark.
+--   Linux: ~/.local/lib/wireshark/plugins/
+--   Windows: %APPDATA%\Wireshark\plugins\
+-- Decode As: UDP port 62030 / 62031 → MMDVM
 
 -- state handling
 local stream_map = {}
 local state_map = {}
 local socket_map = {}
-local f_udp_stream  = Field.new("udp.stream")
+local ta_map = {}
+local f_udp_stream = Field.new("udp.stream")
 
 -- create myproto protocol and its fields
-p_mmdvm = Proto ("MMDVM","MMDVM Protocol")
-p_mmdvm_conf = Proto ("MMDVM_Conf","MMDVM Configuration")
+p_mmdvm = Proto("MMDVM", "MMDVM Protocol")
+p_mmdvm_conf = Proto("MMDVM_Conf", "MMDVM Configuration")
 
--- local f_command = ProtoField.uint16("myproto.command", "Command", base.HEX)
 local f_signature = ProtoField.string("mmdvm.sig", "Signature", base.ASCII)
 local f_seq = ProtoField.uint8("mmdvm.seq", "Sequence", base.DEC)
 local f_len = ProtoField.uint8("mmdvm.len", "Length", base.DEC)
@@ -27,6 +34,12 @@ local f_dmr_pkt = ProtoField.bytes("mmdvm.data", "DMR Data", base.NONE)
 local f_dmr_sig = ProtoField.bytes("mmdvm.sig", "OpenBridge Signature", base.NONE)
 local f_ber = ProtoField.string("mmdvm.ber", "BER", base.ASCII)
 local f_rssi = ProtoField.string("mmdvm.rssi", "RSSI", base.ASCII)
+
+local f_ta_block = ProtoField.uint8("mmdvm.ta.block", "TA Block", base.DEC)
+local f_ta_payload = ProtoField.bytes("mmdvm.ta.payload", "TA Payload", base.NONE)
+local f_ta_format = ProtoField.string("mmdvm.ta.format", "TA Format", base.ASCII)
+local f_ta_size = ProtoField.uint8("mmdvm.ta.size", "TA Size", base.DEC)
+local f_ta_text = ProtoField.string("mmdvm.ta.text", "Talker Alias", base.UTF_8)
 
 local f_salt = ProtoField.bytes("mmdvm.salt", "Salt", base.NONE)
 local f_hash = ProtoField.bytes("mmdvm.hash", "Hash", base.NONE)
@@ -46,586 +59,794 @@ local f_slots = ProtoField.string("mmdvm.slots", "Slots", base.ASCII)
 local f_url = ProtoField.string("mmdvm.url", "URL", base.ASCII)
 local f_software_id = ProtoField.string("mmdvm.sw", "Software ID", base.ASCII)
 local f_package_id = ProtoField.string("mmdvm.pkg", "Package ID", base.ASCII)
-
 local f_options = ProtoField.string("mmdvm.opts", "Options", base.ASCII)
 
-p_mmdvm.fields = {f_signature, f_len, f_seq, f_src_id, f_dst_id, f_rptr_id, f_rptr_id_salt, f_slot, f_call_type,
-  f_frame_type, f_data_type, f_voice_seq, f_stream_id, f_dmr_pkt, f_dmr_sig, f_ber, f_rssi, f_salt, f_hash,
-  f_call_sign, f_rx_freq, f_tx_freq, f_pwr, f_color_code, f_latitude, f_longitude, f_height, f_location,
-  f_description, f_mode, f_slots, f_url, f_software_id, f_package_id, f_options}
+p_mmdvm.fields = {
+    f_signature, f_len, f_seq, f_src_id, f_dst_id, f_rptr_id, f_slot, f_call_type,
+    f_frame_type, f_data_type, f_voice_seq, f_stream_id, f_dmr_pkt, f_dmr_sig, f_ber, f_rssi,
+    f_ta_block, f_ta_payload, f_ta_format, f_ta_size, f_ta_text,
+    f_salt, f_hash, f_call_sign, f_rx_freq, f_tx_freq, f_pwr, f_color_code, f_latitude,
+    f_longitude, f_height, f_location, f_description, f_mode, f_slots, f_url, f_software_id,
+    f_package_id, f_options,
+}
 
--- convert hex to string
 function string.fromhex(str)
-    return (str:gsub('..', function (cc)
+    return (str:gsub("..", function(cc)
         return string.char(tonumber(cc, 16))
     end))
 end
 
 function round(num, precision)
-   return math.floor(num*math.pow(10,precision)+0.5) / math.pow(10,precision)
+    local scale = 10 ^ precision
+    return math.floor(num * scale + 0.5) / scale
 end
 
--- removes leading zeros
 function rem_zero(x)
-  x = x:string()
-  return x:match("0*(%d+)")
+    x = x:string()
+    return x:match("0*(%d+)")
 end
 
--- returns timeslot from MMDVM header
 function call_slot(bits)
-
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  result = bit.band(bits, 0x80)
-  if (result ~= 0) then
-    return "2"
-  else
-    return"1"
-  end
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    if bit.band(bits, 0x80) ~= 0 then
+        return "2"
+    end
+    return "1"
 end
 
--- returns timeslot from BM MMDVM header
 function bm_slot(bits)
-
-  bits = bits(1, 1)
-  result = tonumber(bits)
-  if result == 0 then
-    return "DMO"
-  elseif result == 1 then
-    return"1"
-  elseif result == 2 then
-    return"2"
-  end
+    bits = bits(1, 1)
+    local result = tonumber(bits)
+    if result == 0 then
+        return "DMO"
+    elseif result == 1 then
+        return "1"
+    elseif result == 2 then
+        return "2"
+    end
 end
 
--- returns call type from MMDVM header
 function call_type(bits)
-
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  result = bit.band(bits, 0x40)
-
-  if (result ~= 0) then
-    return "unit"
-  else
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    if bit.band(bits, 0x40) ~= 0 then
+        return "unit"
+    end
     return "group"
-  end
 end
 
--- returns frame type from MMDVM header
 function frame_type(bits)
-
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  bits = bit.band(bits, 0x30)
-  result = bit.rshift(bits, 4)
-
-  if(result == 0) then
-    return "voice"
-  elseif (result == 1) then
-    return "voice_sync"
-  elseif (result == 2) then
-    return "data_sync"
-  else
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    bits = bit.band(bits, 0x30)
+    local result = bit.rshift(bits, 4)
+    if result == 0 then
+        return "voice"
+    elseif result == 1 then
+        return "voice_sync"
+    elseif result == 2 then
+        return "data_sync"
+    end
     return "unknown"
-  end
 end
 
--- returns data type from MMDVM header
 function data_type(bits)
-
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  result = bit.band(bits, 0x0F)
-
-  if(result == 1) then
-    return "voice_head"
-  elseif (result == 2) then
-    return "voice_term"
-  else
-    return "unknown (" .. result ..")"
-  end
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    local result = bit.band(bits, 0x0F)
+    if result == 1 then
+        return "voice_head"
+    elseif result == 2 then
+        return "voice_term"
+    end
+    return "unknown (" .. result .. ")"
 end
 
--- returns voice sequence from MMDVM header
 function voice_seq(bits)
-
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  result = bit.band(bits, 0x0F)
-  if(result == 0) then
-    return "A"
-  elseif (result == 1) then
-    return "B"
-  elseif (result == 2) then
-    return "C"
-  elseif (result == 3) then
-    return "D"
-  elseif (result == 4) then
-    return "E"
-  elseif (result == 5) then
-    return "F"
-  else
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    local result = bit.band(bits, 0x0F)
+    if result == 0 then
+        return "A"
+    elseif result == 1 then
+        return "B"
+    elseif result == 2 then
+        return "C"
+    elseif result == 3 then
+        return "D"
+    elseif result == 4 then
+        return "E"
+    elseif result == 5 then
+        return "F"
+    end
     return ""
-  end
 end
 
--- Gets mode and slot from MMDVM header
 function mode(bits)
-  bits = bits:string()
-  bits = tonumber(bits)
-  if(bits == 4) then
-    return "simplex", ""
-  elseif(bits == 3) then
-    return "duplex", "1,2"
-  elseif(bits == 2) then
-    return "duplex", "2"
-  elseif(bits == 1) then
-    return "duplex", "1"
-  else
+    bits = bits:string()
+    bits = tonumber(bits)
+    if bits == 4 then
+        return "simplex", ""
+    elseif bits == 3 then
+        return "duplex", "1,2"
+    elseif bits == 2 then
+        return "duplex", "2"
+    elseif bits == 1 then
+        return "duplex", "1"
+    end
     return "unknown", ""
-  end
 end
 
--- calculates BER from MMDVM header
 function ber(bits)
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  bits = bits / 1.41
-  result = tostring(round(bits, 2))
-  return result
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    bits = bits / 1.41
+    return tostring(round(bits, 2))
 end
 
--- calculates RSSI from MMDVM header
 function rssi(bits)
-  bits = bits:bytes()
-  bits = bits:get_index(0)
-  result = tostring(bits * -1)
-  return result
+    bits = bits:bytes()
+    bits = bits:get_index(0)
+    return tostring(bits * -1)
 end
 
--- converts TG to string
 function tg(bits)
-    result = bits:uint()
-    return result
+    return bits:uint()
 end
 
--- init maps on start
+function ta_format_name(fmt)
+    if fmt == 0 then
+        return "7bit"
+    elseif fmt == 1 then
+        return "iso8"
+    elseif fmt == 2 then
+        return "utf8"
+    elseif fmt == 3 then
+        return "utf16"
+    end
+    return "unknown"
+end
+
+function tvb_bytes(tvb_range)
+    local len = tvb_range:len()
+    if len == 0 then
+        return ""
+    end
+    local ok, s = pcall(function()
+        return tvb_range:string()
+    end)
+    if ok and s and #s == len then
+        return s
+    end
+    ok, s = pcall(function()
+        return tvb_range:raw()
+    end)
+    if ok and s and #s == len then
+        return s
+    end
+    local chars = {}
+    for i = 0, len - 1 do
+        chars[#chars + 1] = string.char(tvb_range(i, 1):uint())
+    end
+    return table.concat(chars)
+end
+
+function ta_normalize_payload(payload)
+    if not payload or #payload == 0 then
+        return string.rep("\0", 7)
+    end
+    if #payload >= 7 then
+        return payload:sub(1, 7)
+    end
+    return payload .. string.rep("\0", 7 - #payload)
+end
+
+function ta_block_nonempty(payload)
+    if payload == nil then
+        return false
+    end
+    for i = 1, #payload do
+        if payload:byte(i) ~= 0 then
+            return true
+        end
+    end
+    return false
+end
+
+function ta_merge_blocks(blocks)
+    local out = {}
+    for i = 0, 3 do
+        out[#out + 1] = ta_normalize_payload(blocks[i])
+    end
+    return table.concat(out)
+end
+
+function ta_is_header_byte(byte0)
+    if bit.band(byte0, 1) ~= 0 then
+        return false
+    end
+    local fmt = bit.rshift(bit.band(byte0, 0xC0), 6)
+    local size = bit.band(bit.rshift(byte0, 1), 0x1F)
+    return (fmt == 1 or fmt == 2) and size >= 1 and size <= 29
+end
+
+-- Match ADN/MMDVMHost: last block index with any non-zero byte + 1.
+function ta_required_block_count(blocks)
+    local last = -1
+    for i = 0, 3 do
+        if ta_block_nonempty(blocks[i]) then
+            last = i
+        end
+    end
+    return math.max(1, last + 1)
+end
+
+-- When block 0 carries a TA header, derive expected block count from ta_size (ETSI).
+function ta_expected_blocks(blocks)
+    local merged = ta_merge_blocks(blocks)
+    if ta_is_header_byte(merged:byte(1)) then
+        local ta_size = bit.band(bit.rshift(merged:byte(1), 1), 0x1F)
+        local n = math.floor((ta_size + 6) / 7)
+        if n < 1 then
+            n = 1
+        elseif n > 4 then
+            n = 4
+        end
+        return n
+    end
+    return ta_required_block_count(blocks)
+end
+
+function ta_sanitize(text)
+    if not text then
+        return ""
+    end
+    return (text:gsub("%z", ""):match("^%s*(.-)%s*$")) or ""
+end
+
+function ta_decode_complete(buf28)
+    if #buf28 < 1 or not ta_is_header_byte(buf28:byte(1)) then
+        return false
+    end
+    local ta_size = bit.band(bit.rshift(buf28:byte(1), 1), 0x1F)
+    local text, _, _ = ta_decode_text(buf28)
+    return text ~= nil and #ta_sanitize(text) >= ta_size
+end
+
+function ta_decode_7bit(buf28, ta_size)
+    local out = {}
+    local t2 = 0
+    local t1 = 0
+    local c = 0
+    for i = 1, 32 do
+        local b = buf28:byte(i) or 0
+        for j = 7, 0, -1 do
+            c = bit.lshift(c, 1) + bit.band(bit.rshift(b, j), 1)
+            t1 = t1 + 1
+            if t1 == 7 then
+                if i > 1 and t2 < ta_size then
+                    t2 = t2 + 1
+                    out[t2] = string.char(bit.band(c, 0x7F))
+                end
+                t1 = 0
+                c = 0
+            end
+        end
+    end
+    return table.concat(out)
+end
+
+function ta_decode_text(buf28)
+    if #buf28 < 1 then
+        return nil, nil, nil
+    end
+    local header = buf28:byte(1)
+    local ta_format = bit.rshift(bit.band(header, 0xC0), 6)
+    local ta_size = bit.band(bit.rshift(header, 1), 0x1F)
+    local text = nil
+    if ta_format == 1 or ta_format == 2 then
+        text = buf28:sub(2, 1 + ta_size)
+    elseif ta_format == 0 then
+        text = ta_decode_7bit(buf28, ta_size)
+    elseif ta_format == 3 then
+        local chars = {}
+        local t2 = 0
+        for i = 0, 14 do
+            local lo = buf28:byte(2 + 2 * i) or 0
+            local hi = buf28:byte(3 + 2 * i) or 0
+            if t2 >= ta_size then
+                break
+            end
+            if hi == 0 then
+                t2 = t2 + 1
+                chars[t2] = string.char(lo)
+            else
+                t2 = t2 + 1
+                chars[t2] = "?"
+            end
+        end
+        text = table.concat(chars)
+    end
+    return text, ta_format_name(ta_format), ta_size
+end
+
+function ta_payload_preview(block_id, payload)
+    payload = ta_normalize_payload(payload)
+    if block_id == 0 and #payload >= 2 then
+        return ta_sanitize(payload:sub(2))
+    end
+    return ta_sanitize(payload)
+end
+
+function ta_assemble_partial(blocks, needed)
+    local merged = ta_merge_blocks(blocks)
+    if not ta_is_header_byte(merged:byte(1)) then
+        return "", nil, nil
+    end
+    local text, fmt, ta_size = ta_decode_text(merged)
+    return ta_sanitize(text), fmt, ta_size
+end
+
+function ta_store_block(stream_key, block_id, payload)
+    if not ta_map[stream_key] then
+        ta_map[stream_key] = { blocks = {}, last = 0 }
+    end
+    local entry = ta_map[stream_key]
+    entry.blocks[block_id] = ta_normalize_payload(payload)
+    entry.last = os.time()
+
+    local needed = ta_expected_blocks(entry.blocks)
+    local all_received = true
+    for i = 0, needed - 1 do
+        if entry.blocks[i] == nil then
+            all_received = false
+            break
+        end
+    end
+    if not all_received then
+        return nil, nil, nil, false
+    end
+
+    local merged = ta_merge_blocks(entry.blocks)
+    if ta_decode_complete(merged) then
+        local text, fmt, ta_size = ta_decode_text(merged)
+        text = ta_sanitize(text)
+        entry.decoded = text
+        entry.fmt = fmt
+        entry.ta_size = ta_size
+        entry.partial = nil
+        return text, fmt, ta_size, true
+    end
+
+    local partial, fmt, ta_size = ta_assemble_partial(entry.blocks, needed)
+    if partial ~= "" then
+        entry.partial = partial
+        if fmt then
+            entry.fmt = fmt
+        end
+        if ta_size then
+            entry.ta_size = ta_size
+        end
+        return partial, fmt, ta_size, true
+    end
+    return nil, nil, nil, false
+end
+
 function p_mmdvm.init()
     stream_map = {}
     state_map = {}
+    ta_map = {}
 end
 
--- mmdvm dissector function
-function p_mmdvm.dissector (buf, pkt, root)
-  -- validate packet length is adequate, otherwise quit
-
-  if buf:len() == 0 then return end
-  pkt.cols.protocol = p_mmdvm.name
-
-  -- handle state
-  _stream = f_udp_stream().value
-  _number = tostring(pkt.number)
-  _src_ip = tostring(pkt.src)
-  _src_port = tostring(pkt.src_port)
-  _dst_ip = tostring(pkt.dst)
-  _dst_port = tostring(pkt.dst_port)
-  _dst_socket = _dst_ip .. ":" .. _dst_port
-
-  if not pkt.visited then
-    if not stream_map[_stream] then
-      stream_map[_stream] = {}
+function p_mmdvm.dissector(buf, pkt, root)
+    if buf:len() == 0 then
+        return
     end
-  end
+    pkt.cols.protocol = p_mmdvm.name
 
-  -- info("Number: " .. _number .. " Source: " .. _src_ip .. ":" .. _src_port .. " Destination: " .. _dst_ip .. ":" .. _dst_port)
+    local _stream = f_udp_stream().value
+    local _number = tostring(pkt.number)
+    local _src_ip = tostring(pkt.src)
+    local _src_port = tostring(pkt.src_port)
+    local _dst_ip = tostring(pkt.dst)
+    local _dst_port = tostring(pkt.dst_port)
+    local _dst_socket = _dst_ip .. ":" .. _dst_port
 
-  -- create subtree for mmdvm
-  subtree = root:add(p_mmdvm, buf(0))
+    if not pkt.visited then
+        if not stream_map[_stream] then
+            stream_map[_stream] = {}
+        end
+    end
 
-    if (tostring(buf(0,4)):fromhex()) == "DMRD" then
+    local subtree = root:add(p_mmdvm, buf(0))
+    local sig4 = tostring(buf(0, 4)):fromhex()
 
-      _call_type = call_type(buf(15,1))
-      _frame_type = frame_type(buf(15,1))
-      _data_type = data_type(buf(15,1))
-      _voice_seq = voice_seq(buf(15,1))
-      _src_id = tg(buf(5,3))
-      _dst_id = tg(buf(8,3))
+    if sig4 == "DMRA" and buf:len() >= 15 then
+        local _src_id = tg(buf(4, 3))
+        local _block_id = buf(7, 1):uint()
+        local _payload = tvb_bytes(buf(8, 7))
 
-      if buf:len() == 73 then
-        _signed = true
-      else
-        _signed = false
-      end
+        subtree:add(f_signature, buf(0, 4))
+        subtree:add(f_src_id, buf(4, 3))
+        subtree:add(f_ta_block, buf(7, 1), _block_id)
+        subtree:add(f_ta_payload, buf(8, 7))
 
-      _pkt_info = "UNKNOWN"
+        local stream_key = tostring(_stream) .. ":" .. tostring(_src_id)
+        local text, fmt, ta_size, just_completed = ta_store_block(stream_key, _block_id, _payload)
+        local entry = ta_map[stream_key]
 
-      -- add protocol fields to subtree
-      subtree:add(f_signature, buf(0,4))
-      subtree:add(f_seq, buf(4,1))
-      subtree:add(f_src_id, buf(5,3))
-      subtree:add(f_dst_id, buf(8,3))
-      subtree:add(f_rptr_id, buf(11,4))
-      subtree:add(f_slot, buf(15,1), call_slot(buf(15,1)))
-      subtree:add(f_call_type, buf(15,1), _call_type)
-      subtree:add(f_frame_type, buf(15,1), _frame_type)
-
-      if _frame_type == "data_sync" then
-        subtree:add(f_data_type, buf(15,1), _data_type)
-        if _data_type == "voice_head" then
-          _pkt_info = "VOICE HEADER"
-        elseif _data_type == "voice_term" then
-          _pkt_info = "VOICE TERM"
+        local _pkt_info
+        if socket_map[_dst_socket] then
+            _pkt_info = socket_map[_dst_socket] .. ": TALKER ALIAS"
         else
-          _pkt_info =  string.upper(_data_type)
+            _pkt_info = "TALKER ALIAS"
         end
-      else
-        subtree:add(f_voice_seq, buf(15,1), _voice_seq)
-        if _frame_type == "voice_sync" then
-          _pkt_info = "VOICE SYNC  "
+        _pkt_info = _pkt_info .. " [" .. _src_id .. " block " .. _block_id .. "]"
+
+        local needed = entry and ta_expected_blocks(entry.blocks) or 1
+        local all_received = entry ~= nil
+        if all_received then
+            for i = 0, needed - 1 do
+                if entry.blocks[i] == nil then
+                    all_received = false
+                    break
+                end
+            end
+        end
+
+        local assembled = nil
+        if entry and entry.decoded and entry.decoded ~= "" then
+            assembled = entry.decoded
+        elseif entry and entry.partial and entry.partial ~= "" then
+            assembled = entry.partial
+        elseif just_completed and text and text ~= "" then
+            assembled = text
+        end
+
+        local display_text = nil
+        if assembled and all_received and _block_id == needed - 1 then
+            display_text = assembled
+        end
+
+        if display_text then
+            if entry and entry.fmt then
+                subtree:add(f_ta_format, entry.fmt)
+            elseif fmt then
+                subtree:add(f_ta_format, fmt)
+            end
+            local shown_size = (entry and entry.ta_size) or ta_size
+            if shown_size then
+                subtree:add(f_ta_size, shown_size)
+            end
+            subtree:add(f_ta_text, display_text)
+            _pkt_info = _pkt_info .. ' "' .. display_text .. '"'
         else
-          _pkt_info = "VOICE FRAME "
-        end
-      end
-
-      if socket_map[_dst_socket] then
-        _pkt_info = socket_map[_dst_socket] .. ": " .. _pkt_info
-      else
-        _pkt_info = " UNKNOWN" .. ": " .. _pkt_info
-      end
-
-      if _call_type == "unit" then
-        _pkt_info = _pkt_info .. " [" .. _src_id .. " -> " .. _dst_id .. " PRIVATE]"
-      else
-        _pkt_info = _pkt_info .. " [" .. _src_id .. " -> " .. _dst_id .. " GROUP]"
-      end
-
-      if _signed then
-        _pkt_info = _pkt_info .. " (SIGNED)"
-      end
-
-      pkt.cols.info:set(_pkt_info)
-
-      subtree:add(f_stream_id, buf(16,4))
-      subtree:add(f_dmr_pkt, buf(20,33))
-      if buf:len() == 55 then
-
-        _ber = ber(buf(53,1))
-        _rssi = rssi(buf(54,1))
-
-        subtree:add(f_ber, buf(53,1), _ber)
-             :append_text("%")
-        if tonumber(_rssi) < 0 then
-          subtree:add(f_rssi, buf(54,1), _rssi)
-                 :append_text("dBm")
-        end
-      elseif _signed then
-        subtree:add(f_dmr_sig, buf(53,20))
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTP" then
-      subtree:add(f_signature, buf(0,7))
-      subtree:add(f_rptr_id, buf(7,4))
-      pkt.cols.info:set("RPT->MST: PING")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
-
-    elseif (tostring(buf(0,4)):fromhex()) == "MSTP" then
-      subtree:add(f_signature, buf(0,7))
-      subtree:add(f_rptr_id, buf(7,4))
-      pkt.cols.info:set("MST->RPT: PONG")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "MST->RPT"
-      end
-
-    elseif (tostring(buf(0,5)):fromhex()) == "RPTCL" then
-      subtree:add(f_signature, buf(0,5))
-      subtree:add(f_rptr_id, buf(5,4))
-      pkt.cols.info:set("RPT->MST: CLOSING DOWN")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "MSTC" then
-      subtree:add(f_signature, buf(0,5))
-      subtree:add(f_rptr_id, buf(5,4))
-      pkt.cols.info:set("MST->RPT: CLOSING DOWN")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "MST->RPT"
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTL" then
-      subtree:add(f_signature, buf(0,4))
-      subtree:add(f_rptr_id, buf(4,4))
-      pkt.cols.info:set("RPT->MST: LOGIN INIT")
-
-      if not pkt.visited then
-        stream_map[_stream]["STATE"] = "INIT"
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTK" then
-      subtree:add(f_signature, buf(0,4))
-      subtree:add(f_rptr_id, buf(4,4))
-      subtree:add(f_hash, buf(8,(buf:len() - 8)))
-      pkt.cols.info:set("RPT->MST: AUTH")
-
-      if not pkt.visited then
-        stream_map[_stream]["STATE"] = "AUTH"
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTA" then
-
-      subtree:add(f_signature, buf(0,6))
-
-      if not pkt.visited then
-
-         socket_map[_dst_socket] = "MST->RPT"
-
-        if not state_map[_number] then
-          state_map[_number] = {}
+            local preview = ta_payload_preview(_block_id, _payload)
+            if preview ~= "" then
+                _pkt_info = _pkt_info .. ' fragment="' .. preview .. '"'
+            elseif _block_id == 0 and #_payload >= 1 and ta_is_header_byte(_payload:byte(1)) then
+                _pkt_info = _pkt_info .. " (header)"
+            end
         end
 
-        if stream_map[_stream]["STATE"] == "INIT" then
-            state_map[_number]["STATE"] = "INIT"
+        pkt.cols.info:set(_pkt_info)
+
+    elseif sig4 == "DMRD" then
+        local _call_type = call_type(buf(15, 1))
+        local _frame_type = frame_type(buf(15, 1))
+        local _data_type = data_type(buf(15, 1))
+        local _voice_seq = voice_seq(buf(15, 1))
+        local _src_id = tg(buf(5, 3))
+        local _dst_id = tg(buf(8, 3))
+        local _signed = buf:len() == 73
+
+        subtree:add(f_signature, buf(0, 4))
+        subtree:add(f_seq, buf(4, 1))
+        subtree:add(f_src_id, buf(5, 3))
+        subtree:add(f_dst_id, buf(8, 3))
+        subtree:add(f_rptr_id, buf(11, 4))
+        subtree:add(f_slot, buf(15, 1), call_slot(buf(15, 1)))
+        subtree:add(f_call_type, buf(15, 1), _call_type)
+        subtree:add(f_frame_type, buf(15, 1), _frame_type)
+
+        local _pkt_info = "UNKNOWN"
+        if _frame_type == "data_sync" then
+            subtree:add(f_data_type, buf(15, 1), _data_type)
+            if _data_type == "voice_head" then
+                _pkt_info = "VOICE HEADER"
+            elseif _data_type == "voice_term" then
+                _pkt_info = "VOICE TERM"
+            else
+                _pkt_info = string.upper(_data_type)
+            end
+        else
+            subtree:add(f_voice_seq, buf(15, 1), _voice_seq)
+            if _frame_type == "voice_sync" then
+                _pkt_info = "VOICE SYNC "
+            else
+                _pkt_info = "VOICE FRAME "
+            end
+        end
+
+        if socket_map[_dst_socket] then
+            _pkt_info = socket_map[_dst_socket] .. ": " .. _pkt_info
+        else
+            _pkt_info = " UNKNOWN: " .. _pkt_info
+        end
+
+        if _call_type == "unit" then
+            _pkt_info = _pkt_info .. " [" .. _src_id .. " -> " .. _dst_id .. " PRIVATE]"
+        else
+            _pkt_info = _pkt_info .. " [" .. _src_id .. " -> " .. _dst_id .. " GROUP]"
+        end
+
+        if _signed then
+            _pkt_info = _pkt_info .. " (SIGNED)"
+        end
+
+        pkt.cols.info:set(_pkt_info)
+        subtree:add(f_stream_id, buf(16, 4))
+        subtree:add(f_dmr_pkt, buf(20, 33))
+
+        if buf:len() == 55 then
+            local _ber = ber(buf(53, 1))
+            local _rssi = rssi(buf(54, 1))
+            subtree:add(f_ber, buf(53, 1), _ber):append_text("%")
+            if tonumber(_rssi) < 0 then
+                subtree:add(f_rssi, buf(54, 1), _rssi):append_text("dBm")
+            end
+        elseif _signed then
+            subtree:add(f_dmr_sig, buf(53, 20))
+        end
+
+    elseif sig4 == "RPTP" then
+        subtree:add(f_signature, buf(0, 7))
+        subtree:add(f_rptr_id, buf(7, 4))
+        pkt.cols.info:set("RPT->MST: PING")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "RPT->MST"
+        end
+
+    elseif sig4 == "MSTP" then
+        subtree:add(f_signature, buf(0, 7))
+        subtree:add(f_rptr_id, buf(7, 4))
+        pkt.cols.info:set("MST->RPT: PONG")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "MST->RPT"
+        end
+
+    elseif tostring(buf(0, 5)):fromhex() == "RPTCL" then
+        subtree:add(f_signature, buf(0, 5))
+        subtree:add(f_rptr_id, buf(5, 4))
+        pkt.cols.info:set("RPT->MST: CLOSING DOWN")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "RPT->MST"
+        end
+
+    elseif sig4 == "MSTC" then
+        subtree:add(f_signature, buf(0, 5))
+        subtree:add(f_rptr_id, buf(5, 4))
+        pkt.cols.info:set("MST->RPT: CLOSING DOWN")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "MST->RPT"
+        end
+
+    elseif sig4 == "RPTL" then
+        subtree:add(f_signature, buf(0, 4))
+        subtree:add(f_rptr_id, buf(4, 4))
+        pkt.cols.info:set("RPT->MST: LOGIN INIT")
+        if not pkt.visited then
+            stream_map[_stream]["STATE"] = "INIT"
+        end
+
+    elseif sig4 == "RPTK" then
+        subtree:add(f_signature, buf(0, 4))
+        subtree:add(f_rptr_id, buf(4, 4))
+        subtree:add(f_hash, buf(8, buf:len() - 8))
+        pkt.cols.info:set("RPT->MST: AUTH")
+        if not pkt.visited then
+            stream_map[_stream]["STATE"] = "AUTH"
+            socket_map[_dst_socket] = "RPT->MST"
+        end
+
+    elseif sig4 == "RPTA" then
+        subtree:add(f_signature, buf(0, 6))
+        if not pkt.visited then
+            socket_map[_dst_socket] = "MST->RPT"
+            if not state_map[_number] then
+                state_map[_number] = {}
+            end
+            if stream_map[_stream]["STATE"] == "INIT" then
+                state_map[_number]["STATE"] = "INIT"
+                if buf:len() == 10 then
+                    subtree:add(f_salt, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH CHALLENGE"
+                elseif buf:len() == 14 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    subtree:add(f_salt, buf(10, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH CHALLENGE"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH CHALLENGE [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            elseif stream_map[_stream]["STATE"] == "AUTH" then
+                state_map[_number]["STATE"] = "AUTH"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH SUCCESSFUL"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH SUCCESSFUL [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            elseif stream_map[_stream]["STATE"] == "LOGIN" or stream_map[_stream]["STATE"] == "CONF" then
+                state_map[_number]["STATE"] = "LOGIN"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: LOGIN SUCCESSFUL"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: LOGIN SUCCESSFUL [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            elseif stream_map[_stream]["STATE"] == "OPTIONS" then
+                state_map[_number]["STATE"] = "LOGIN"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: OPTIONS SUCCESSFUL"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: OPTIONS SUCCESSFUL [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            end
+        elseif state_map[_number] and state_map[_number]["STATE"] ~= "INIT" then
+            pkt.cols.info:set(state_map[_number]["MSG"])
+            if not state_map[_number]["MALFORMED"] then
+                subtree:add(f_rptr_id, buf(6, 4))
+            end
+        elseif state_map[_number] and state_map[_number]["STATE"] == "INIT" then
+            pkt.cols.info:set(state_map[_number]["MSG"])
             if buf:len() == 10 then
-                subtree:add(f_salt, buf(6,4))
-                state_map[_number]['MSG'] = "MST->RPT: AUTH CHALLENGE"
+                subtree:add(f_salt, buf(6, 4))
             elseif buf:len() == 14 then
-                subtree:add(f_rptr_id, buf(6,4))
-                subtree:add(f_salt, buf(10,4))
-                state_map[_number]['MSG'] = "MST->RPT: AUTH CHALLENGE"
-            else
-                subtree:add(f_salt, buf(6,4))
-                state_map[_number]['MALFORMED'] = true
-                state_map[_number]['MSG'] = "MST->RPT: AUTH CHALLENGE [MALFORMED]"
+                subtree:add(f_rptr_id, buf(6, 4))
+                subtree:add(f_salt, buf(10, 4))
             end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        elseif stream_map[_stream]["STATE"] == "AUTH" then
-            state_map[_number]['STATE'] = "AUTH"
-            if buf:len() == 10 then
-              subtree:add(f_rptr_id, buf(6,4))
-              state_map[_number]['MSG'] = "MST->RPT: AUTH SUCCESSFUL"
-            else
-              state_map[_number]['MALFORMED'] = true
-              state_map[_number]['MSG'] = "MST->RPT: AUTH SUCCESSFUL [MALFORMED]"
-            end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        elseif stream_map[_stream]["STATE"] == "LOGIN" or stream_map[_stream]["STATE"] == "CONF" then
-            state_map[_number]['STATE'] = "LOGIN"
-            if buf:len() == 10 then
-              subtree:add(f_rptr_id, buf(6,4))
-              state_map[_number]['MSG'] = "MST->RPT: LOGIN SUCCESSFUL"
-            else
-              state_map[_number]['MALFORMED'] = true
-              state_map[_number]['MSG'] = "MST->RPT: LOGIN SUCCESSFUL [MALFORMED]"
-            end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        elseif stream_map[_stream]["STATE"] == "OPTIONS" then
-            state_map[_number]['STATE'] = "LOGIN"
-            if buf:len() == 10 then
-              subtree:add(f_rptr_id, buf(6,4))
-              state_map[_number]['MSG'] = "MST->RPT: OPTIONS SUCCESSFUL"
-            else
-              state_map[_number]['MALFORMED'] = true
-              state_map[_number]['MSG'] = "MST->RPT: OPTIONS SUCCESSFUL [MALFORMED]"
-            end
-            pkt.cols.info:set(state_map[_number]['MSG'])
         end
 
-      elseif state_map[_number]['STATE'] ~= "INIT" then
-        _message = state_map[_number]['MSG']
-        pkt.cols.info:set(_message)
-        if not state_map[_number]['MALFORMED'] then
-           subtree:add(f_rptr_id, buf(6,4))
-        end
-
-      elseif state_map[_number]['STATE'] == "INIT" then
-        _message = state_map[_number]['MSG']
-        pkt.cols.info:set(_message)
-        if buf:len() == 10 then
-            subtree:add(f_salt, buf(6,4))
-        elseif buf:len() == 14 then
-            subtree:add(f_rptr_id, buf(6,4))
-            subtree:add(f_salt, buf(10,4))
-        end
-      end
-
-    elseif (tostring(buf(0,6)):fromhex()) == "MSTNAK" then
-
-      subtree:add(f_signature, buf(0,6))
-      info("NAK in frame" .. _number)
-
-      if not pkt.visited then
-
-        info("univsited NAK in frame" .. _number)
-
-        if not state_map[_number] then
-          state_map[_number] = {}
-        end
-
-        if stream_map[_stream]["STATE"] == "INIT" then
-            state_map[_number]["STATE"] = "INIT"
-            if buf:len() == 10 then
-                subtree:add(f_salt, buf(6,4))
-                state_map[_number]['MSG'] = "MST->RPT: LOGIN INIT FAILED"
-            else
-                state_map[_number]['MALFORMED'] = true
-                state_map[_number]['MSG'] = "MST->RPT: LOGIN INIT FAILED [MALFORMED]"
+    elseif tostring(buf(0, 6)):fromhex() == "MSTNAK" then
+        subtree:add(f_signature, buf(0, 6))
+        if not pkt.visited then
+            if not state_map[_number] then
+                state_map[_number] = {}
             end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        elseif stream_map[_stream]["STATE"] == "AUTH" then
-            state_map[_number]['STATE'] = "AUTH"
-            if buf:len() == 10 then
-              subtree:add(f_rptr_id, buf(6,4))
-              state_map[_number]['MSG'] = "MST->RPT: AUTH FAILED"
+            if stream_map[_stream]["STATE"] == "INIT" then
+                state_map[_number]["STATE"] = "INIT"
+                if buf:len() == 10 then
+                    subtree:add(f_salt, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: LOGIN INIT FAILED"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: LOGIN INIT FAILED [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            elseif stream_map[_stream]["STATE"] == "AUTH" then
+                state_map[_number]["STATE"] = "AUTH"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH FAILED"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: AUTH FAILED [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            elseif stream_map[_stream]["STATE"] == "CONF" then
+                state_map[_number]["STATE"] = "CONF"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: CONF FAILED"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: CONF FAILED [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
+            elseif stream_map[_stream]["STATE"] == "OPTIONS" then
+                state_map[_number]["STATE"] = "LOGIN"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    state_map[_number]["MSG"] = "MST->RPT: OPTIONS FAILED"
+                else
+                    state_map[_number]["MALFORMED"] = true
+                    state_map[_number]["MSG"] = "MST->RPT: OPTIONS FAILED [MALFORMED]"
+                end
+                pkt.cols.info:set(state_map[_number]["MSG"])
             else
-              state_map[_number]['MALFORMED'] = true
-              state_map[_number]['MSG'] = "MST->RPT: AUTH FAILED [MALFORMED]"
+                if buf:len() == 10 then
+                    subtree:add(f_rptr_id, buf(6, 4))
+                    pkt.cols.info:set("MSTNAK")
+                else
+                    pkt.cols.info:set("MSTNAK [MALFORMED]")
+                end
             end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        elseif stream_map[_stream]["STATE"] == "CONF" then
-            state_map[_number]['STATE'] = "CONF"
-            if buf:len() == 10 then
-              subtree:add(f_rptr_id, buf(6,4))
-              state_map[_number]['MSG'] = "MST->RPT: CONF FAILED"
-            else
-              state_map[_number]['MALFORMED'] = true
-              state_map[_number]['MSG'] = "MST->RPT: CONF FAILED [MALFORMED]"
+        elseif state_map[_number] then
+            pkt.cols.info:set(state_map[_number]["MSG"])
+            if not state_map[_number]["MALFORMED"] then
+                subtree:add(f_rptr_id, buf(6, 4))
             end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        elseif stream_map[_stream]["STATE"] == "OPTIONS" then
-            state_map[_number]['STATE'] = "LOGIN"
-            if buf:len() == 10 then
-              subtree:add(f_rptr_id, buf(6,4))
-              state_map[_number]['MSG'] = "MST->RPT: OPTIONS FAILED"
-            else
-              state_map[_number]['MALFORMED'] = true
-              state_map[_number]['MSG'] = "MST->RPT: OPTIONS FAILED [MALFORMED]"
-            end
-            pkt.cols.info:set(state_map[_number]['MSG'])
-
-        else
-          if buf:len() == 10 then
-            subtree:add(f_rptr_id, buf(6,4))
-            pkt.cols.info:set("MSTNAK")
-          else
-             pkt.cols.info:set("MSTNAK [MALFORMED]")
-          end
         end
 
-      else
-
-        info("visited NAK in frame" .. _number)
-        _message = state_map[_number]['MSG']
-        pkt.cols.info:set(_message)
-        if not state_map[_number]['MALFORMED'] then
-           subtree:add(f_rptr_id, buf(6,4))
+    elseif sig4 == "RPTC" then
+        local _mode, _slots = mode(buf(97, 1))
+        subtree:add(f_signature, buf(0, 4))
+        subtree:add(f_rptr_id, buf(4, 4))
+        local conftree = subtree:add(p_mmdvm_conf, buf(8))
+        conftree:add(f_call_sign, buf(8, 8))
+        conftree:add(f_rx_freq, buf(16, 9))
+        conftree:add(f_tx_freq, buf(25, 9))
+        conftree:add(f_pwr, buf(34, 2), rem_zero(buf(34, 2))):append_text("W")
+        conftree:add(f_color_code, buf(36, 2), rem_zero(buf(36, 2)))
+        conftree:add(f_latitude, buf(38, 8))
+        conftree:add(f_longitude, buf(46, 9))
+        conftree:add(f_height, buf(55, 3), rem_zero(buf(55, 3))):append_text("M")
+        conftree:add(f_location, buf(58, 20))
+        conftree:add(f_description, buf(78, 19))
+        conftree:add(f_mode, buf(97, 1), _mode)
+        if _mode == "duplex" then
+            conftree:add(f_slots, buf(97, 1), _slots)
         end
-      end
+        conftree:add(f_url, buf(98, 124))
+        conftree:add(f_software_id, buf(222, 40))
+        conftree:add(f_package_id, buf(262, 40))
+        pkt.cols.info:set("RPT->MST: CONF")
+        if not pkt.visited then
+            stream_map[_stream]["STATE"] = "CONF"
+            socket_map[_dst_socket] = "RPT->MST"
+        end
 
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTC" then
+    elseif sig4 == "RPTO" then
+        subtree:add(f_signature, buf(0, 4))
+        subtree:add(f_rptr_id, buf(4, 4))
+        subtree:add(f_options, buf(8, buf:len() - 8))
+        pkt.cols.info:set("RPT->MST: OPTIONS")
+        if not pkt.visited then
+            stream_map[_stream]["STATE"] = "OPTIONS"
+            socket_map[_dst_socket] = "RPT->MST"
+        end
 
-      _mode, _slots = mode(buf(97,1))
+    elseif tostring(buf(0, 6)):fromhex() == "RPTSBKN" then
+        subtree:add(f_signature, buf(0, 6))
+        subtree:add(f_rptr_id_ascii, buf(6, 8))
+        pkt.cols.info:set("MST->RPT: BEACON")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "MST->RPT"
+        end
 
-      subtree:add(f_signature, buf(0,4))
-      subtree:add(f_rptr_id, buf(4,4))
+    elseif tostring(buf(0, 7)):fromhex() == "RPTRSSI" then
+        local _bm_slot = bm_slot(buf(10, 2))
+        subtree:add(f_signature, buf(0, 7))
+        subtree:add(f_rptr_id_ascii, buf(7, 8))
+        subtree:add(f_slots, buf(15, 2), _bm_slot)
+        subtree:add(f_rssi, buf(17, 5)):append_text("dBm")
+        pkt.cols.info:set("RPT->MST: RSSI")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "RPT->MST"
+        end
 
-      conftree = subtree:add(p_mmdvm_conf, buf(8))
-      conftree:add(f_call_sign, buf(8,8))
-      conftree:add(f_rx_freq, buf(16,9))
-      conftree:add(f_tx_freq, buf(25,9))
-      conftree:add(f_pwr, buf(34,2), rem_zero(buf(34,2)))
-              :append_text("W")
-      conftree:add(f_color_code, buf(36,2), rem_zero(buf(36,2)))
-      conftree:add(f_latitude, buf(38,8))
-      conftree:add(f_longitude, buf(46,9))
-      conftree:add(f_height, buf(55,3), rem_zero(buf(55,3)))
-              :append_text("M")
-      conftree:add(f_location, buf(58,20))
-      conftree:add(f_description, buf(78,19))
-      conftree:add(f_mode, buf(97,1), _mode)
-      if _mode == 'duplex' then
-        conftree:add(f_slots, buf(97,1), _slots)
-      end
-      conftree:add(f_url, buf(98,124))
-      conftree:add(f_software_id, buf(222,40))
-      conftree:add(f_package_id, buf(262,40))
-      pkt.cols.info:set("RPT->MST: CONF")
-
-      if not pkt.visited then
-        stream_map[_stream]["STATE"] = "CONF"
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTO" then
-
-      subtree:add(f_signature, buf(0,4))
-      subtree:add(f_rptr_id, buf(4,4))
-      subtree:add(f_options, buf(8,buf:len() - 8 ))
-      pkt.cols.info:set("RPT->MST: OPTIONS")
-
-      if not pkt.visited then
-        stream_map[_stream]["STATE"] = "OPTIONS"
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
-    elseif (tostring(buf(0,4)):fromhex()) == "RPTSBKN" then
-
-      subtree:add(f_signature, buf(0,6))
-      subtree:add(f_rptr_id_ascii, buf(6,8))
-      pkt.cols.info:set("MST->RPT: BEACON")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "MST->RPT"
-      end
-
-    elseif (tostring(buf(0,7)):fromhex()) == "RPTRSSI" then
-
-      _bm_slot = bm_slot(buf(10,2))
-
-      subtree:add(f_signature, buf(0,7))
-      subtree:add(f_rptr_id_ascii, buf(7,8))
-      subtree:add(f_slots, buf(15,2), _bm_slot)
-      subtree:add(f_rssi, buf(17,5))
-             :append_text("dBm")
-      pkt.cols.info:set("RPT->MST: RSSI")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
-    elseif (tostring(buf(0,7)):fromhex()) == "RPTINTR" then
-
-      _bm_slot = bm_slot(buf(10,2))
-
-      subtree:add(f_signature, buf(0,7))
-      subtree:add(f_rptr_id_ascii, buf(7,8))
-      subtree:add(f_slots, buf(15,2), _bm_slot)
-      pkt.cols.info:set("RPT->MST: CALL INTERRUPT")
-
-      if not pkt.visited then
-        socket_map[_dst_socket] = "RPT->MST"
-      end
-
+    elseif tostring(buf(0, 7)):fromhex() == "RPTINTR" then
+        local _bm_slot = bm_slot(buf(10, 2))
+        subtree:add(f_signature, buf(0, 7))
+        subtree:add(f_rptr_id_ascii, buf(7, 8))
+        subtree:add(f_slots, buf(15, 2), _bm_slot)
+        pkt.cols.info:set("RPT->MST: CALL INTERRUPT")
+        if not pkt.visited then
+            socket_map[_dst_socket] = "RPT->MST"
+        end
     end
 end
 
--- register a chained dissector for port 62030
 local udp_dissector_table = DissectorTable.get("udp.port")
-dissector = udp_dissector_table:get_dissector(62031)
-  -- you can call dissector from function p_mmdvm.dissector above
-  -- so that the previous dissector gets called
+udp_dissector_table:add(62030, p_mmdvm)
 udp_dissector_table:add(62031, p_mmdvm)
