@@ -10,6 +10,7 @@ All contributions and feedback are much appreciated.
 
 * Parses MMDVM frames, showing all fields.
 * Tracks login state per client, so the login process is displayed correctly.
+* Talker Alias: decodes **DMRA** UDP packets and **embedded LC** in DMRD voice bursts B–E (FLCO 4–7). Field `mmdvm.ta.via` is `DMRA` or `embedded`; assembled text is `mmdvm.ta.text`.
 
 ### Screenshots
 
