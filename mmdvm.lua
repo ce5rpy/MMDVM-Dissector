@@ -1,5 +1,7 @@
 -- Wireshark dissector for MMDVM / Homebrew (HBP) protocol.
--- Based on marrold/MMDVM-Dissector with DMRA Talker Alias support (ADN / MMDVMHost HBP).
+-- Based on marrold/MMDVM-Dissector with Talker Alias support (ADN / MMDVMHost HBP):
+--   * DMRA UDP packets
+--   * Embedded LC in DMRD voice bursts B–E (FLCO 4–7; same path radios use)
 --
 -- Install: copy to Wireshark plugins dir and restart Wireshark.
 --   Linux: ~/.local/lib/wireshark/plugins/
@@ -11,7 +13,11 @@ local stream_map = {}
 local state_map = {}
 local socket_map = {}
 local ta_map = {}
+-- Per-call accumulator for embedded LC fragments (vseq 1–4 → one 9-byte LC)
+local ta_voice_acc = {}
 local f_udp_stream = Field.new("udp.stream")
+local FLCO_TA_HEADER = 4
+local FLCO_TA_BLOCK3 = 7
 
 -- create myproto protocol and its fields
 p_mmdvm = Proto("MMDVM", "MMDVM Protocol")
@@ -40,6 +46,9 @@ local f_ta_payload = ProtoField.bytes("mmdvm.ta.payload", "TA Payload", base.NON
 local f_ta_format = ProtoField.string("mmdvm.ta.format", "TA Format", base.ASCII)
 local f_ta_size = ProtoField.uint8("mmdvm.ta.size", "TA Size", base.DEC)
 local f_ta_text = ProtoField.string("mmdvm.ta.text", "Talker Alias", base.UTF_8)
+local f_ta_via = ProtoField.string("mmdvm.ta.via", "TA Source", base.ASCII)
+local f_ta_flco = ProtoField.uint8("mmdvm.ta.flco", "TA FLCO", base.DEC)
+local f_ta_embed_lc = ProtoField.bytes("mmdvm.ta.embed_lc", "Embedded TA LC", base.NONE)
 
 local f_salt = ProtoField.bytes("mmdvm.salt", "Salt", base.NONE)
 local f_hash = ProtoField.bytes("mmdvm.hash", "Hash", base.NONE)
@@ -64,7 +73,7 @@ local f_options = ProtoField.string("mmdvm.opts", "Options", base.ASCII)
 p_mmdvm.fields = {
     f_signature, f_len, f_seq, f_src_id, f_dst_id, f_rptr_id, f_slot, f_call_type,
     f_frame_type, f_data_type, f_voice_seq, f_stream_id, f_dmr_pkt, f_dmr_sig, f_ber, f_rssi,
-    f_ta_block, f_ta_payload, f_ta_format, f_ta_size, f_ta_text,
+    f_ta_block, f_ta_payload, f_ta_format, f_ta_size, f_ta_text, f_ta_via, f_ta_flco, f_ta_embed_lc,
     f_salt, f_hash, f_call_sign, f_rx_freq, f_tx_freq, f_pwr, f_color_code, f_latitude,
     f_longitude, f_height, f_location, f_description, f_mode, f_slots, f_url, f_software_id,
     f_package_id, f_options,
@@ -143,10 +152,14 @@ function data_type(bits)
     return "unknown (" .. result .. ")"
 end
 
-function voice_seq(bits)
+function voice_seq_num(bits)
     bits = bits:bytes()
     bits = bits:get_index(0)
-    local result = bit.band(bits, 0x0F)
+    return bit.band(bits, 0x0F)
+end
+
+function voice_seq(bits)
+    local result = voice_seq_num(bits)
     if result == 0 then
         return "A"
     elseif result == 1 then
@@ -161,6 +174,183 @@ function voice_seq(bits)
         return "F"
     end
     return ""
+end
+
+-- DMR voice burst → bit table (264 bits from 33 bytes), big-endian MSB first.
+function dmr_bytes_to_bits(s)
+    local bits = {}
+    for i = 1, #s do
+        local b = s:byte(i)
+        for j = 7, 0, -1 do
+            bits[#bits + 1] = bit.band(bit.rshift(b, j), 1)
+        end
+    end
+    return bits
+end
+
+-- EMBED LC fragment: bits [116,148) of the 33-byte DMR payload (32 bits).
+function dmr_embed_fragment(dmrpkt33)
+    if not dmrpkt33 or #dmrpkt33 < 33 then
+        return nil
+    end
+    local bits = dmr_bytes_to_bits(dmrpkt33)
+    local emb = {}
+    for i = 116, 147 do
+        emb[#emb + 1] = bits[i + 1]
+    end
+    return emb
+end
+
+-- BPTC(128,72) data-bit deinterleave → 9-byte LC (matches adn_server.domain.dmr.bptc.decode_emblc).
+function decode_emblc(elc128)
+    if not elc128 or #elc128 < 128 then
+        return nil
+    end
+    local function e(i)
+        return elc128[i + 1] or 0
+    end
+    local rows = {
+        { 0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80 },
+        { 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81 },
+        { 2, 10, 18, 26, 34, 42, 50, 58, 66, 74 },
+        { 3, 11, 19, 27, 35, 43, 51, 59, 67, 75 },
+        { 4, 12, 20, 28, 36, 44, 52, 60, 68, 76 },
+        { 5, 13, 21, 29, 37, 45, 53, 61, 69, 77 },
+        { 6, 14, 22, 30, 38, 46, 54, 62, 70, 78 },
+    }
+    local outbits = {}
+    for _, row in ipairs(rows) do
+        for _, idx in ipairs(row) do
+            outbits[#outbits + 1] = e(idx)
+        end
+    end
+    local chars = {}
+    for bi = 0, 8 do
+        local v = 0
+        for j = 0, 7 do
+            v = bit.lshift(v, 1) + (outbits[bi * 8 + j + 1] or 0)
+        end
+        chars[#chars + 1] = string.char(v)
+    end
+    return table.concat(chars)
+end
+
+-- Reassemble B–E, decode LC; if FLCO 4–7 store TA block. Returns block_id or nil.
+function try_buffer_ta_from_voice(stream_key, vseq, dmrpkt33)
+    if vseq < 1 or vseq > 4 then
+        return nil
+    end
+    local frag = dmr_embed_fragment(dmrpkt33)
+    if not frag then
+        return nil
+    end
+    if not ta_voice_acc[stream_key] then
+        ta_voice_acc[stream_key] = {}
+    end
+    local acc = ta_voice_acc[stream_key]
+    if vseq == 1 then
+        for k in pairs(acc) do
+            acc[k] = nil
+        end
+    end
+    acc[vseq] = frag
+    if not (acc[1] and acc[2] and acc[3] and acc[4]) then
+        return nil
+    end
+    local elc = {}
+    for v = 1, 4 do
+        for i = 1, 32 do
+            elc[#elc + 1] = acc[v][i]
+        end
+    end
+    for k in pairs(acc) do
+        acc[k] = nil
+    end
+    local lc = decode_emblc(elc)
+    if not lc or #lc < 9 then
+        return nil
+    end
+    local flco = lc:byte(1)
+    if flco < FLCO_TA_HEADER or flco > FLCO_TA_BLOCK3 then
+        return nil
+    end
+    local block_id = flco - FLCO_TA_HEADER
+    local payload = lc:sub(3, 9)
+    local text, fmt, ta_size, just_completed = ta_store_block(stream_key, block_id, payload)
+    return {
+        block_id = block_id,
+        payload = payload,
+        flco = flco,
+        lc = lc,
+        text = text,
+        fmt = fmt,
+        ta_size = ta_size,
+        just_completed = just_completed,
+    }
+end
+
+function bytes_to_hex(s)
+    if not s then
+        return ""
+    end
+    return (s:gsub(".", function(c)
+        return string.format("%02x", string.byte(c))
+    end))
+end
+
+-- Shared Info/tree annotation after a TA block is stored (DMRA or embedded).
+-- Returns (display_text_or_nil, info_suffix).
+function ta_annotate(subtree, stream_key, block_id, payload, text, fmt, ta_size, just_completed, via)
+    local entry = ta_map[stream_key]
+    subtree:add(f_ta_via, via)
+
+    local needed = entry and ta_expected_blocks(entry.blocks) or 1
+    local all_received = entry ~= nil
+    if all_received then
+        for i = 0, needed - 1 do
+            if entry.blocks[i] == nil then
+                all_received = false
+                break
+            end
+        end
+    end
+
+    local assembled = nil
+    if entry and entry.decoded and entry.decoded ~= "" then
+        assembled = entry.decoded
+    elseif entry and entry.partial and entry.partial ~= "" then
+        assembled = entry.partial
+    elseif just_completed and text and text ~= "" then
+        assembled = text
+    end
+
+    local display_text = nil
+    if assembled and all_received and block_id == needed - 1 then
+        display_text = assembled
+    end
+
+    local suffix = ""
+    if display_text then
+        if entry and entry.fmt then
+            subtree:add(f_ta_format, entry.fmt)
+        elseif fmt then
+            subtree:add(f_ta_format, fmt)
+        end
+        local shown_size = (entry and entry.ta_size) or ta_size
+        if shown_size then
+            subtree:add(f_ta_size, shown_size)
+        end
+        subtree:add(f_ta_text, display_text)
+        suffix = ' "' .. display_text .. '"'
+    else
+        local preview = ta_payload_preview(block_id, payload)
+        if preview ~= "" then
+            suffix = ' fragment="' .. preview .. '"'
+        elseif block_id == 0 and payload and #payload >= 1 and ta_is_header_byte(payload:byte(1)) then
+            suffix = " (header)"
+        end
+    end
+    return display_text, suffix
 end
 
 function mode(bits)
@@ -437,6 +627,7 @@ function p_mmdvm.init()
     stream_map = {}
     state_map = {}
     ta_map = {}
+    ta_voice_acc = {}
 end
 
 function p_mmdvm.dissector(buf, pkt, root)
@@ -474,7 +665,6 @@ function p_mmdvm.dissector(buf, pkt, root)
 
         local stream_key = tostring(_stream) .. ":" .. tostring(_src_id)
         local text, fmt, ta_size, just_completed = ta_store_block(stream_key, _block_id, _payload)
-        local entry = ta_map[stream_key]
 
         local _pkt_info
         if socket_map[_dst_socket] then
@@ -484,58 +674,17 @@ function p_mmdvm.dissector(buf, pkt, root)
         end
         _pkt_info = _pkt_info .. " [" .. _src_id .. " block " .. _block_id .. "]"
 
-        local needed = entry and ta_expected_blocks(entry.blocks) or 1
-        local all_received = entry ~= nil
-        if all_received then
-            for i = 0, needed - 1 do
-                if entry.blocks[i] == nil then
-                    all_received = false
-                    break
-                end
-            end
-        end
-
-        local assembled = nil
-        if entry and entry.decoded and entry.decoded ~= "" then
-            assembled = entry.decoded
-        elseif entry and entry.partial and entry.partial ~= "" then
-            assembled = entry.partial
-        elseif just_completed and text and text ~= "" then
-            assembled = text
-        end
-
-        local display_text = nil
-        if assembled and all_received and _block_id == needed - 1 then
-            display_text = assembled
-        end
-
-        if display_text then
-            if entry and entry.fmt then
-                subtree:add(f_ta_format, entry.fmt)
-            elseif fmt then
-                subtree:add(f_ta_format, fmt)
-            end
-            local shown_size = (entry and entry.ta_size) or ta_size
-            if shown_size then
-                subtree:add(f_ta_size, shown_size)
-            end
-            subtree:add(f_ta_text, display_text)
-            _pkt_info = _pkt_info .. ' "' .. display_text .. '"'
-        else
-            local preview = ta_payload_preview(_block_id, _payload)
-            if preview ~= "" then
-                _pkt_info = _pkt_info .. ' fragment="' .. preview .. '"'
-            elseif _block_id == 0 and #_payload >= 1 and ta_is_header_byte(_payload:byte(1)) then
-                _pkt_info = _pkt_info .. " (header)"
-            end
-        end
-
+        local _, suffix = ta_annotate(
+            subtree, stream_key, _block_id, _payload, text, fmt, ta_size, just_completed, "DMRA"
+        )
+        _pkt_info = _pkt_info .. suffix
         pkt.cols.info:set(_pkt_info)
 
     elseif sig4 == "DMRD" then
         local _call_type = call_type(buf(15, 1))
         local _frame_type = frame_type(buf(15, 1))
         local _data_type = data_type(buf(15, 1))
+        local _vseq_num = voice_seq_num(buf(15, 1))
         local _voice_seq = voice_seq(buf(15, 1))
         local _src_id = tg(buf(5, 3))
         local _dst_id = tg(buf(8, 3))
@@ -585,9 +734,38 @@ function p_mmdvm.dissector(buf, pkt, root)
             _pkt_info = _pkt_info .. " (SIGNED)"
         end
 
-        pkt.cols.info:set(_pkt_info)
         subtree:add(f_stream_id, buf(16, 4))
         subtree:add(f_dmr_pkt, buf(20, 33))
+
+        -- Embedded Talker Alias: voice bursts B–E (not voice_sync A / F).
+        -- Key includes udp.stream so parallel RX legs (e.g. 7141 vs 7301) do not share the B–E accumulator.
+        if _frame_type == "voice" and _vseq_num >= 1 and _vseq_num <= 4 and buf:len() >= 53 then
+            local _stream_id = buf(16, 4):uint()
+            local stream_key = string.format("%s:%u:%s", tostring(_stream), _stream_id, tostring(_src_id))
+            local dmrpkt = tvb_bytes(buf(20, 33))
+            local hit = try_buffer_ta_from_voice(stream_key, _vseq_num, dmrpkt)
+            if hit then
+                subtree:add(f_ta_flco, hit.flco)
+                subtree:add(f_ta_block, hit.block_id)
+                local lc_item = subtree:add(f_ta_embed_lc)
+                lc_item:set_text("Embedded TA LC: " .. bytes_to_hex(hit.lc))
+                _pkt_info = _pkt_info .. " TA#" .. hit.block_id
+                local _, suffix = ta_annotate(
+                    subtree,
+                    stream_key,
+                    hit.block_id,
+                    hit.payload,
+                    hit.text,
+                    hit.fmt,
+                    hit.ta_size,
+                    hit.just_completed,
+                    "embedded"
+                )
+                _pkt_info = _pkt_info .. suffix
+            end
+        end
+
+        pkt.cols.info:set(_pkt_info)
 
         if buf:len() == 55 then
             local _ber = ber(buf(53, 1))
